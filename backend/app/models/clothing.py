@@ -6,8 +6,10 @@ from typing import Optional
 class ClothingItem:
     id: str
     name: str
-    category = "Unknown"
-    color = "Unknown"
+
+    # AI-detectable attributes
+    category: str = "Unknown"
+    color: str = "Unknown"
     pattern: Optional[str] = None
     material: Optional[str] = None
     fit: Optional[str] = None
@@ -19,5 +21,5 @@ class ClothingItem:
     comfortable: Optional[bool] = None
     personal_rating: Optional[int] = None
 
-    # Image
+    # Image information
     image_path: Optional[str] = None
