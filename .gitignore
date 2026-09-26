@@ -36,3 +36,6 @@ data/processed/*
 
 # Local files
 *.local
+
+# Uploaded clothing images
+backend/uploads/*

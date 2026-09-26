@@ -6,8 +6,8 @@ from typing import Optional
 class ClothingItem:
     id: str
     name: str
-    category: str
-    color: str
+    category = "Unknown"
+    color = "Unknown"
     pattern: Optional[str] = None
     material: Optional[str] = None
     fit: Optional[str] = None
