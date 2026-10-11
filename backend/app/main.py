@@ -147,6 +147,54 @@ def item_dict(row):
     return d
 
 
+def refresh_wear_totals(c, item_ids):
+    """Keep legacy API counters as an atomic cache of migrated baseline plus event rows."""
+    for item_id in set(item_ids):
+        c.execute("""UPDATE clothing SET wear_count=legacy_wear_count+
+          (SELECT COUNT(*) FROM wear_event_items wi JOIN wear_events we ON we.id=wi.event_id
+           WHERE wi.clothing_id=clothing.id),
+          last_worn=NULLIF(MAX(COALESCE(legacy_last_worn,''),COALESCE((SELECT MAX(we.worn_on)
+           FROM wear_event_items wi JOIN wear_events we ON we.id=wi.event_id
+           WHERE wi.clothing_id=clothing.id),'')),'') WHERE id=?""", (item_id,))
+
+
+def item_snapshot(row):
+    item = item_dict(row)
+    return {key: item.get(key) for key in ("id", "name", "category", "color", "season", "style", "image_url")}
+
+
+def wear_event_dict(c, row):
+    result = dict(row)
+    result["items"] = []
+    for item_row in c.execute("SELECT clothing_id,item_snapshot FROM wear_event_items WHERE event_id=? ORDER BY ordinal", (result["id"],)):
+        snapshot = json.loads(item_row["item_snapshot"])
+        current = c.execute("SELECT * FROM clothing WHERE id=? AND user_id=?", (item_row["clothing_id"], result["user_id"])).fetchone() if item_row["clothing_id"] else None
+        if current:
+            result["items"].append(item_dict(current))
+        else:
+            snapshot["deleted"] = True
+            snapshot["image_url"] = None
+            result["items"].append(snapshot)
+    result["item_ids"] = [item["id"] for item in result["items"] if item.get("id")]
+    return result
+
+
+def save_event_items(c, event_id, item_ids, owner_id):
+    ids = list(dict.fromkeys(item_ids))
+    if not ids:
+        raise HTTPException(422, "Choose at least one wardrobe item")
+    marks = ",".join("?" for _ in ids)
+    rows = c.execute(f"SELECT * FROM clothing WHERE user_id=? AND id IN ({marks})", [owner_id, *ids]).fetchall()
+    if len(rows) != len(ids):
+        raise HTTPException(422, "Wear history can only include your own wardrobe items")
+    by_id = {row["id"]: row for row in rows}
+    c.execute("DELETE FROM wear_event_items WHERE event_id=?", (event_id,))
+    c.executemany("INSERT INTO wear_event_items(event_id,ordinal,clothing_id,item_snapshot) VALUES(?,?,?,?)", [
+        (event_id, index, item_id, json.dumps(item_snapshot(by_id[item_id]))) for index, item_id in enumerate(ids)
+    ])
+    return ids
+
+
 def owned_item(c, item_id, user_id):
     row = c.execute("SELECT * FROM clothing WHERE id=? AND user_id=?", (item_id, user_id)).fetchone()
     if not row:
@@ -510,7 +558,7 @@ def update_preferences(body: PreferencesInput, user=Depends(current_user)):
     return body.model_dump()
 
 
-def score_outfit(items, occasion, prefs, feedback, disliked=False):
+def score_outfit(items, occasion, prefs, feedback, disliked=False, wear_context=None):
     score, reasons = 55, []
     cats = {x["category"].lower() for x in items}
     if len(items) >= 2 and len(cats) > 1:
@@ -549,12 +597,29 @@ def score_outfit(items, occasion, prefs, feedback, disliked=False):
             if not item.get("last_worn"):
                 continue
             try:
-                age = datetime.now(timezone.utc) - datetime.fromisoformat(item["last_worn"])
-                recently_worn += age.days < 7
-            except ValueError:
+                worn_day = date.fromisoformat(item["last_worn"][:10])
+                recently_worn += (date.today() - worn_day).days < 7
+            except (ValueError, TypeError):
                 continue
         if recently_worn:
             score -= recently_worn * 15; reasons.append("Leaves room for pieces you have not worn recently")
+    if wear_context:
+        variety = prefs.get("variety", 50) / 100
+        recent_items = sum(1 for item in items if wear_context.get("item_days", {}).get(item["id"]) is not None and wear_context["item_days"][item["id"]] <= 14)
+        if recent_items:
+            score -= round(recent_items * 10 * variety)
+            reasons.append("Ranks lower because a piece was worn in the last two weeks")
+        elif any(item["id"] in wear_context.get("item_days", {}) for item in items):
+            score += round(4 * variety)
+            reasons.append("Adds variety with pieces you have not worn recently")
+        signature = tuple(sorted(item["id"] for item in items))
+        days = wear_context.get("pair_days", {}).get(signature)
+        if days is not None and days <= 30:
+            score -= round((14 if days <= 14 else 7) * variety)
+            reasons.append("Ranks lower because this combination was worn recently")
+        elif days is None and wear_context.get("pair_days"):
+            score += round(3 * variety)
+            reasons.append("Offers a combination not present in recent wear history")
     if disliked:
         score -= 35; reasons.append("Similar to a look you rated poorly")
     score += max(-10, min(10, feedback * 2))
@@ -570,11 +635,33 @@ def recommendations(occasion: str = "", user=Depends(current_user)):
         avg = c.execute("SELECT COALESCE(AVG(rating)-3,0) FROM feedback WHERE user_id=?", (user["id"],)).fetchone()[0]
         disliked_rows = c.execute("SELECT oi.outfit_id, oi.clothing_id FROM outfit_items oi JOIN outfits o ON o.id=oi.outfit_id JOIN feedback f ON f.outfit_id=o.id WHERE f.user_id=? AND f.rating<=2", (user["id"],)).fetchall()
         disliked_signatures = c.execute("SELECT item_signature FROM feedback WHERE user_id=? AND rating<=2 AND item_signature IS NOT NULL", (user["id"],)).fetchall()
+        wear_rows = c.execute("""SELECT wi.clothing_id,we.worn_on,we.id FROM wear_events we
+          JOIN wear_event_items wi ON wi.event_id=we.id WHERE we.user_id=? AND wi.clothing_id IS NOT NULL
+          ORDER BY we.worn_on DESC""", (user["id"],)).fetchall()
     if len(items) < 2:
         return {"recommendations": [], "message": "Add at least two pieces to get outfit ideas."}
     prefs = {k: (json.loads(pref_row[k]) if k in ("styles", "colors", "occasions", "avoid_colors", "neutral_colors", "accent_colors", "seasons") else pref_row[k]) for k in pref_row.keys() if k != "user_id"}
     disliked = {frozenset(row["clothing_id"] for row in disliked_rows if row["outfit_id"] == outfit_id) for outfit_id in {row["outfit_id"] for row in disliked_rows}}
     disliked.update(frozenset(json.loads(row["item_signature"])) for row in disliked_signatures)
+    wear_context = {"item_days": {}, "pair_days": {}}
+    today = date.today()
+    event_items = {}
+    for row in wear_rows:
+        try:
+            age = max(0, (today - date.fromisoformat(row["worn_on"][:10])).days)
+        except ValueError:
+            continue
+        wear_context["item_days"].setdefault(row["clothing_id"], age)
+        event_items.setdefault(row["id"], {"date": row["worn_on"], "ids": set()})["ids"].add(row["clothing_id"])
+    for event in event_items.values():
+        if len(event["ids"]) < 2:
+            continue
+        signature = tuple(sorted(event["ids"]))
+        try:
+            age = max(0, (today - date.fromisoformat(event["date"][:10])).days)
+        except ValueError:
+            continue
+        wear_context["pair_days"][signature] = min(age, wear_context["pair_days"].get(signature, age))
     tops = [i for i in items if any(x in i["category"].lower() for x in ("shirt", "top", "blouse", "sweater", "jacket", "dress"))]
     bottoms = [i for i in items if any(x in i["category"].lower() for x in ("pant", "jean", "skirt", "short"))]
     pool = tops + bottoms if tops and bottoms else items
@@ -585,7 +672,7 @@ def recommendations(occasion: str = "", user=Depends(current_user)):
             if a["category"] == b["category"] and a["category"].lower() not in ("unknown", "other"): continue
             pair = frozenset((a["id"], b["id"]))
             if prefs.get("exclude_disliked") and pair in disliked: continue
-            score, why = score_outfit([a,b], occasion, prefs, avg, pair in disliked)
+            score, why = score_outfit([a,b], occasion, prefs, avg, pair in disliked, wear_context)
             combos.append({"items": [a,b], "score": score, "reasons": why, "occasion": occasion or None})
     combos.sort(key=lambda x: (-x["score"], sum(i["wear_count"] for i in x["items"]) * (0.5 + prefs.get("variety", 50) / 50)))
     return {"recommendations": combos[:6], "message": None}
@@ -672,18 +759,128 @@ def submit_feedback(body: FeedbackInput, user=Depends(current_user)):
     return {"ok":True}
 
 
-@app.get("/history")
-def history(user=Depends(current_user)):
+def resolve_event_item_ids(c, body, owner_id):
+    if body.outfit_id:
+        outfit = c.execute("SELECT * FROM outfits WHERE id=? AND user_id=?", (body.outfit_id, owner_id)).fetchone()
+        if not outfit:
+            raise HTTPException(404, "Outfit not found")
+        saved_ids = [row[0] for row in c.execute("SELECT clothing_id FROM outfit_items WHERE outfit_id=? ORDER BY rowid", (body.outfit_id,)).fetchall()]
+        if body.item_ids is not None and set(body.item_ids) != set(saved_ids):
+            raise HTTPException(422, "Items must match the selected saved outfit")
+        return saved_ids, outfit["name"]
+    return body.item_ids or [], None
+
+
+@app.post("/wear-events", status_code=201)
+def create_wear_event(body: WearEventInput, user=Depends(current_user)):
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM outfits WHERE user_id=? ORDER BY created_at DESC LIMIT 100", (user["id"],)).fetchall()]
+        if body.request_id:
+            prior = c.execute("SELECT * FROM wear_events WHERE user_id=? AND request_id=?", (user["id"], body.request_id)).fetchone()
+            if prior:
+                return wear_event_dict(c, prior)
+        ids, outfit_name = resolve_event_item_ids(c, body, user["id"])
+        event_id, timestamp = str(uuid4()), now()
+        c.execute("INSERT INTO wear_events(id,user_id,worn_on,outfit_id,outfit_snapshot,occasion,notes,request_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (event_id, user["id"], body.worn_on.isoformat(), body.outfit_id, outfit_name, body.occasion, body.notes, body.request_id, timestamp, timestamp))
+        affected = save_event_items(c, event_id, ids, user["id"])
+        refresh_wear_totals(c, affected)
+        return wear_event_dict(c, c.execute("SELECT * FROM wear_events WHERE id=?", (event_id,)).fetchone())
 
 
-@app.post("/wardrobe/{item_id}/wear")
+@app.get("/wear-events")
+def list_wear_events(from_date: date | None = None, to_date: date | None = None, user=Depends(current_user)):
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(422, "Start date must be on or before end date")
+    clauses, params = ["user_id=?"], [user["id"]]
+    if from_date:
+        clauses.append("worn_on>=?"); params.append(from_date.isoformat())
+    if to_date:
+        clauses.append("worn_on<=?"); params.append(to_date.isoformat())
+    with db() as c:
+        rows = c.execute(f"SELECT * FROM wear_events WHERE {' AND '.join(clauses)} ORDER BY worn_on DESC,created_at DESC LIMIT 500", params).fetchall()
+        return [wear_event_dict(c, row) for row in rows]
+
+
+@app.get("/wear-events/{event_id}")
+def get_wear_event(event_id: str, user=Depends(current_user)):
+    with db() as c:
+        row = c.execute("SELECT * FROM wear_events WHERE id=? AND user_id=?", (event_id, user["id"])).fetchone()
+        if not row:
+            raise HTTPException(404, "Wear event not found")
+        return wear_event_dict(c, row)
+
+
+@app.put("/wear-events/{event_id}")
+def update_wear_event(event_id: str, body: WearEventInput, user=Depends(current_user)):
+    with db() as c:
+        existing = c.execute("SELECT * FROM wear_events WHERE id=? AND user_id=?", (event_id, user["id"])).fetchone()
+        if not existing:
+            raise HTTPException(404, "Wear event not found")
+        ids, outfit_name = resolve_event_item_ids(c, body, user["id"])
+        old_ids = [row[0] for row in c.execute("SELECT clothing_id FROM wear_event_items WHERE event_id=? AND clothing_id IS NOT NULL", (event_id,))]
+        timestamp = now()
+        c.execute("UPDATE wear_events SET worn_on=?,outfit_id=?,outfit_snapshot=?,occasion=?,notes=?,updated_at=? WHERE id=?",
+                  (body.worn_on.isoformat(), body.outfit_id, outfit_name, body.occasion, body.notes, timestamp, event_id))
+        new_ids = save_event_items(c, event_id, ids, user["id"])
+        refresh_wear_totals(c, old_ids + new_ids)
+        return wear_event_dict(c, c.execute("SELECT * FROM wear_events WHERE id=?", (event_id,)).fetchone())
+
+
+@app.delete("/wear-events/{event_id}")
+def delete_wear_event(event_id: str, user=Depends(current_user)):
+    with db() as c:
+        if not c.execute("SELECT 1 FROM wear_events WHERE id=? AND user_id=?", (event_id, user["id"])).fetchone():
+            raise HTTPException(404, "Wear event not found")
+        ids = [row[0] for row in c.execute("SELECT clothing_id FROM wear_event_items WHERE event_id=? AND clothing_id IS NOT NULL", (event_id,))]
+        c.execute("DELETE FROM wear_events WHERE id=? AND user_id=?", (event_id, user["id"]))
+        refresh_wear_totals(c, ids)
+    return {"ok": True}
+
+
+@app.get("/insights")
+def wear_insights(from_date: date | None = None, to_date: date | None = None, user=Depends(current_user)):
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(422, "Start date must be on or before end date")
+    clauses, params = ["user_id=?"], [user["id"]]
+    if from_date:
+        clauses.append("worn_on>=?"); params.append(from_date.isoformat())
+    if to_date:
+        clauses.append("worn_on<=?"); params.append(to_date.isoformat())
+    where = " AND ".join(clauses)
+    with db() as c:
+        total = c.execute(f"SELECT COUNT(*) FROM wear_events WHERE {where}", params).fetchone()[0]
+        frequent_items = c.execute(f"""SELECT wi.clothing_id AS id,json_extract(wi.item_snapshot,'$.name') name,
+          json_extract(wi.item_snapshot,'$.category') category,COUNT(*) wears,MAX(we.worn_on) last_worn
+          FROM wear_events we JOIN wear_event_items wi ON wi.event_id=we.id WHERE {where}
+          GROUP BY wi.clothing_id,name,category ORDER BY wears DESC,last_worn DESC LIMIT 8""", params).fetchall()
+        category_rows = c.execute(f"""SELECT COALESCE(json_extract(wi.item_snapshot,'$.category'),'Unknown') category,COUNT(*) wears
+          FROM wear_events we JOIN wear_event_items wi ON wi.event_id=we.id WHERE {where}
+          GROUP BY category ORDER BY wears DESC LIMIT 8""", params).fetchall()
+        activity = c.execute(f"SELECT worn_on,COUNT(*) events FROM wear_events WHERE {where} GROUP BY worn_on ORDER BY worn_on", params).fetchall()
+        top_outfits = c.execute(f"""SELECT COALESCE(we.outfit_id,'' ) id,COALESCE(we.outfit_snapshot,'Assembled outfit') name,COUNT(*) wears,MAX(we.worn_on) last_worn
+          FROM wear_events we WHERE {where} AND we.outfit_snapshot IS NOT NULL
+          GROUP BY we.outfit_id,we.outfit_snapshot ORDER BY wears DESC,last_worn DESC LIMIT 5""", params).fetchall()
+        last_conditions = " AND ".join(["we.id=wi.event_id", "we.user_id=c.user_id", "wi.clothing_id=c.id"] + (["we.worn_on>=?"] if from_date else []) + (["we.worn_on<=?"] if to_date else []))
+        range_params = ([from_date.isoformat()] if from_date else []) + ([to_date.isoformat()] if to_date else [])
+        least_recent = c.execute(f"""SELECT c.id,c.name,c.category,MAX(we.worn_on) last_worn
+          FROM clothing c LEFT JOIN wear_event_items wi ON wi.clothing_id=c.id
+          LEFT JOIN wear_events we ON {last_conditions} WHERE c.user_id=?
+          GROUP BY c.id ORDER BY last_worn IS NOT NULL,last_worn ASC,c.name LIMIT 8""", [*range_params, user["id"]]).fetchall()
+        recent_rows = c.execute(f"SELECT * FROM wear_events WHERE {where} ORDER BY worn_on DESC,created_at DESC LIMIT 20", params).fetchall()
+        earliest = c.execute(f"SELECT MIN(worn_on) FROM wear_events WHERE {where}", params).fetchone()[0]
+        latest = c.execute(f"SELECT MAX(worn_on) FROM wear_events WHERE {where}", params).fetchone()[0]
+        return {"total_events": total, "from_date": from_date.isoformat() if from_date else None,
+          "to_date": to_date.isoformat() if to_date else None, "first_worn_on": earliest, "last_worn_on": latest,
+          "top_items": [dict(row) for row in frequent_items], "categories": [dict(row) for row in category_rows],
+          "activity": [dict(row) for row in activity], "top_outfits": [dict(row) for row in top_outfits],
+          "least_recent_items": [dict(row) for row in least_recent],
+          "recent_events": [wear_event_dict(c, row) for row in recent_rows]}
+
+
+@app.post("/wardrobe/{item_id}/wear", status_code=201)
 def wear_item(item_id: str, user=Depends(current_user)):
-    with db() as c:
-        owned_item(c,item_id,user["id"])
-        c.execute("UPDATE clothing SET wear_count=wear_count+1,last_worn=?,updated_at=? WHERE id=?",(now(),now(),item_id))
-    return {"ok":True}
+    body = WearEventInput(worn_on=date.today(), item_ids=[item_id])
+    return create_wear_event(body, user)
 
 
 @app.get("/export")

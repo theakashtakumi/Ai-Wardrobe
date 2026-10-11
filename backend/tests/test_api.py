@@ -1,6 +1,7 @@
 import asyncio
 import io
 import sqlite3
+from datetime import timedelta
 
 import httpx
 import pytest
@@ -297,4 +298,132 @@ def test_database_failure_does_not_leave_an_uploaded_or_saved_item(isolated_stor
             response = await client.post("/wardrobe", data={"name": "Should not persist", "analyze": "false"}, files={"file": ("piece.png", io.BytesIO(b"\x89PNG\r\n\x1a\nbody"), "image/png")})
             assert response.status_code == 500
             assert list(main.UPLOAD_DIR.iterdir()) == []
+    run(scenario())
+
+
+def test_wear_event_crud_insights_counts_and_idempotency(isolated_store):
+    async def scenario():
+        today = main.date.today()
+        yesterday = today - timedelta(days=1)
+        three_days_ago = today - timedelta(days=3)
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await register(client)
+            shirt = await upload(client, "Linen shirt", "Shirt", "White")
+            trousers = await upload(client, "Navy trousers", "Trousers", "Navy")
+            outfit = (await client.post("/outfits", json={"name": "Work uniform", "occasion": "Work", "item_ids": [shirt["id"], trousers["id"]]})).json()
+            event_payload = {"worn_on": yesterday.isoformat(), "outfit_id": outfit["id"], "occasion": "Work", "notes": "Comfortable", "request_id": "wear-submit-1"}
+            first = await client.post("/wear-events", json=event_payload)
+            repeated_submit = await client.post("/wear-events", json=event_payload)
+            assert first.status_code == 201 and repeated_submit.json()["id"] == first.json()["id"]
+            repeated_day = await client.post("/wear-events", json={**event_payload, "request_id": "wear-submit-2"})
+            assert repeated_day.status_code == 201 and repeated_day.json()["id"] != first.json()["id"]
+            shirt_only = await client.post("/wear-events", json={"worn_on": three_days_ago.isoformat(), "item_ids": [shirt["id"]]})
+            assert shirt_only.status_code == 201
+            assert [item["name"] for item in first.json()["items"]] == ["Linen shirt", "Navy trousers"]
+            assert (await client.get(f"/wear-events/{first.json()['id']}")).json()["notes"] == "Comfortable"
+            assert len((await client.get("/wear-events", params={"from_date": yesterday.isoformat(), "to_date": yesterday.isoformat()})).json()) == 2
+            assert (await client.get("/wear-events", params={"from_date": (today + timedelta(days=1)).isoformat(), "to_date": (today - timedelta(days=1)).isoformat()})).status_code == 422
+            with main.db() as connection:
+                counts = dict(connection.execute("SELECT id,wear_count FROM clothing").fetchall())
+                assert counts == {shirt["id"]: 3, trousers["id"]: 2}
+
+            changed = await client.put(f"/wear-events/{first.json()['id']}", json={"worn_on": today.isoformat(), "item_ids": [trousers["id"]], "notes": "Edited"})
+            assert changed.status_code == 200 and changed.json()["item_ids"] == [trousers["id"]]
+            with main.db() as connection:
+                counts = dict(connection.execute("SELECT id,wear_count FROM clothing").fetchall())
+                assert counts == {shirt["id"]: 2, trousers["id"]: 2}
+            summary = (await client.get("/insights", params={"from_date": (today.replace(day=1)).isoformat(), "to_date": today.isoformat()})).json()
+            assert summary["total_events"] == 3
+            assert summary["top_items"][0]["name"] == "Navy trousers"
+            assert summary["top_items"][0]["wears"] == 2
+            assert any(category["category"] == "Trousers" and category["wears"] == 2 for category in summary["categories"])
+            assert summary["top_outfits"][0]["name"] == "Work uniform"
+            assert summary["activity"]
+            assert (await client.delete(f"/wear-events/{first.json()['id']}")).status_code == 200
+            assert (await client.get(f"/wear-events/{first.json()['id']}")).status_code == 404
+            with main.db() as connection:
+                counts = dict(connection.execute("SELECT id,wear_count FROM clothing").fetchall())
+                assert counts == {shirt["id"]: 2, trousers["id"]: 1}
+                fresh = main.connect()
+                assert fresh.execute("SELECT COUNT(*) FROM wear_events").fetchone()[0] == 2
+                fresh.close()
+    run(scenario())
+
+
+def test_wear_history_validation_ownership_and_deleted_item_snapshots(isolated_store):
+    async def scenario():
+        today = main.date.today().isoformat()
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as owner:
+            assert (await owner.get("/wear-events")).status_code == 401
+            await register(owner)
+            top = await upload(owner, "Snapshot top", "Shirt", "Green")
+            bottom = await upload(owner, "Snapshot trousers", "Trousers", "Black")
+            saved = (await owner.post("/outfits", json={"name": "Snapshot look", "item_ids": [top["id"], bottom["id"]]})).json()
+            created = await owner.post("/wear-events", json={"worn_on": today, "outfit_id": saved["id"], "item_ids": [top["id"]]})
+            assert created.status_code == 422
+            assert (await owner.post("/wear-events", json={"worn_on": "not-a-date", "item_ids": [top["id"]]})).status_code == 422
+            assert (await owner.post("/wear-events", json={"worn_on": today})).status_code == 422
+            assert (await owner.post("/wear-events", json={"worn_on": "2099-01-01", "item_ids": [top["id"]]})).status_code == 422
+            event = (await owner.post("/wear-events", json={"worn_on": today, "outfit_id": saved["id"]})).json()
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as other:
+                await register(other, "wear-other@example.com")
+                assert (await other.get("/wear-events")).json() == []
+                assert (await other.get(f"/wear-events/{event['id']}")).status_code == 404
+                assert (await other.put(f"/wear-events/{event['id']}", json={"worn_on": today, "item_ids": [top["id"]]})).status_code == 404
+                assert (await other.delete(f"/wear-events/{event['id']}")).status_code == 404
+                assert (await other.post("/wear-events", json={"worn_on": today, "item_ids": [top["id"]]})).status_code == 422
+                assert (await other.post("/wear-events", json={"worn_on": today, "outfit_id": saved["id"]})).status_code == 404
+            assert (await owner.delete(f"/wardrobe/{top['id']}")).status_code == 200
+            assert (await owner.delete(f"/outfits/{saved['id']}")).status_code == 200
+            preserved = (await owner.get(f"/wear-events/{event['id']}" )).json()
+            assert preserved["outfit_id"] is None and preserved["outfit_snapshot"] == "Snapshot look"
+            assert preserved["items"][0]["name"] == "Snapshot top" and preserved["items"][0]["deleted"] is True
+            assert preserved["items"][0]["image_url"] is None
+    run(scenario())
+
+
+def test_migrated_wear_count_is_a_preserved_legacy_baseline(isolated_store):
+    async def scenario():
+        today = main.date.today().isoformat()
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await register(client)
+            piece = await upload(client, "Old count piece", "Shirt", "Blue")
+            with main.db() as connection:
+                connection.execute("UPDATE clothing SET wear_count=7,last_worn='2026-09-01' WHERE id=?", (piece["id"],))
+                connection.execute("ALTER TABLE clothing DROP COLUMN legacy_wear_count")
+                connection.execute("ALTER TABLE clothing DROP COLUMN legacy_last_worn")
+            main.initialize()
+            with main.db() as connection:
+                legacy = connection.execute("SELECT legacy_wear_count,legacy_last_worn FROM clothing WHERE id=?", (piece["id"],)).fetchone()
+                assert tuple(legacy) == (7, "2026-09-01")
+            event = await client.post("/wear-events", json={"worn_on": today, "item_ids": [piece["id"]]})
+            assert event.status_code == 201
+            assert (await client.get(f"/wardrobe/{piece['id']}")).json()["wear_count"] == 8
+            assert (await client.delete(f"/wear-events/{event.json()['id']}")).status_code == 200
+            item = (await client.get(f"/wardrobe/{piece['id']}")).json()
+            assert item["wear_count"] == 7 and item["last_worn"] == "2026-09-01"
+    run(scenario())
+
+
+def test_recommendations_use_event_history_and_still_work_without_it(isolated_store):
+    async def scenario():
+        today = main.date.today().isoformat()
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await register(client)
+            tops = [await upload(client, "Shirt A", "Shirt", "White"), await upload(client, "Shirt B", "Shirt", "Blue")]
+            bottoms = [await upload(client, "Trousers A", "Trousers", "Black"), await upload(client, "Trousers B", "Trousers", "Gray")]
+            no_history = (await client.get("/recommendations")).json()["recommendations"]
+            assert len(no_history) == 4
+            pair_a = {tops[0]["id"], bottoms[0]["id"]}
+            await client.post("/wear-events", json={"worn_on": today, "item_ids": list(pair_a)})
+            with_history = (await client.get("/recommendations")).json()["recommendations"]
+            by_pair = {frozenset(item["id"] for item in combo["items"]): combo for combo in with_history}
+            unworn_pair = frozenset((tops[1]["id"], bottoms[1]["id"]))
+            assert by_pair[frozenset(pair_a)]["score"] < by_pair[unworn_pair]["score"]
+            assert any("worn" in reason.lower() for reason in by_pair[frozenset(pair_a)]["reasons"])
+            assert any("history" in reason.lower() for reason in by_pair[unworn_pair]["reasons"])
     run(scenario())
