@@ -29,6 +29,7 @@ Thumbs.db
 
 # Python cache
 .pytest_cache/
+.pytest-tmp*/
 
 # Data
 data/raw/*
@@ -39,3 +40,7 @@ data/processed/*
 
 # Uploaded clothing images
 backend/uploads/*
+
+# Local private wardrobe database
+backend/data/*.sqlite3
+backend/data/*.sqlite3-*
