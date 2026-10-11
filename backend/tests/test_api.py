@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import sqlite3
 from datetime import timedelta
 
@@ -298,6 +299,161 @@ def test_database_failure_does_not_leave_an_uploaded_or_saved_item(isolated_stor
             response = await client.post("/wardrobe", data={"name": "Should not persist", "analyze": "false"}, files={"file": ("piece.png", io.BytesIO(b"\x89PNG\r\n\x1a\nbody"), "image/png")})
             assert response.status_code == 500
             assert list(main.UPLOAD_DIR.iterdir()) == []
+    run(scenario())
+
+
+def test_ai_response_validation_and_unavailable_status(isolated_store, monkeypatch):
+    assert main.normalize_ai_attributes({"name": "  Linen   shirt ", "category": "Shirt", "private": "discard", "bad": {"x": 1}}) == {"name": "Linen shirt", "category": "Shirt"}
+    with pytest.raises(ValueError):
+        main.normalize_ai_attributes(["not", "an", "object"])
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            token = await register(client)
+            status = await client.get("/ai/status", headers={"Authorization": f"Bearer {token}"})
+            assert status.status_code == 200
+            assert status.json()["configured"] is False and status.json()["available"] is False
+            assert "Manual entry" in status.json()["message"]
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as anonymous:
+                assert (await anonymous.get("/ai/status")).status_code == 401
+    run(scenario())
+
+
+def test_ollama_vision_payload_and_malformed_response_manual_fallback(isolated_store, monkeypatch):
+    monkeypatch.setenv("OLLAMA_MODEL", "vision-test-model")
+    seen = []
+
+    class FakeResponse:
+        def __init__(self, body): self.body = json.dumps(body).encode()
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self): return self.body
+
+    def valid_response(request, timeout=90):
+        body = json.loads(request.data)
+        seen.append(body)
+        return FakeResponse({"response": json.dumps({"name": "Olive overshirt", "category": "Shirt", "color": "Olive"})})
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", valid_response)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            await register(client)
+            image_bytes = b"\x89PNG\r\n\x1a\nshirt-photo"
+            created = await client.post("/wardrobe", data={"name": "Manual name", "category": "Unknown", "color": "Unknown", "analyze": "true"}, files={"file": ("shirt.png", image_bytes, "image/png")})
+            assert created.status_code == 201
+            assert created.json()["name"] == "Manual name"  # User-entered values take precedence.
+            assert created.json()["category"] == "Shirt" and created.json()["color"] == "Olive"
+            assert created.json()["ai_provider"] == "vision-test-model"
+            assert seen[0]["model"] == "vision-test-model" and seen[0]["images"] == [main.base64.b64encode(image_bytes).decode()]
+
+            def malformed_response(_request, timeout=90):
+                return FakeResponse({"response": "not-json"})
+            monkeypatch.setattr(main.urllib.request, "urlopen", malformed_response)
+            fallback = await client.post("/wardrobe", data={"name": "Manual fallback", "category": "Top", "color": "Blue", "analyze": "true"}, files={"file": ("top.png", image_bytes, "image/png")})
+            assert fallback.status_code == 201
+            assert fallback.json()["name"] == "Manual fallback" and fallback.json()["category"] == "Top"
+            assert fallback.json()["analysis_warning"] and fallback.json()["ai_provider"] is None
+    run(scenario())
+
+
+def test_weather_provider_configuration_and_failures(isolated_store, monkeypatch):
+    monkeypatch.delenv("WEATHER_PROVIDER", raising=False)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            token = await register(client)
+            headers = {"Authorization": f"Bearer {token}"}
+            missing = await client.get("/weather/locations", params={"query": "Delhi"}, headers=headers)
+            assert missing.status_code == 503 and "manually" in missing.json()["detail"]
+            assert (await client.get("/weather/locations", params={"query": "D"}, headers=headers)).status_code == 422
+            assert (await client.get("/weather/current", params={"latitude": 91, "longitude": 0}, headers=headers)).status_code == 422
+            # Existing recommendations remain usable without external weather configuration.
+            await upload(client, "Cotton shirt", "Shirt", "Blue")
+            await upload(client, "Denim jeans", "Jeans", "Navy")
+            plain = await client.get("/recommendations", headers=headers)
+            assert plain.status_code == 200 and plain.json()["recommendations"]
+            assert plain.json()["weather_context"] is None
+    run(scenario())
+
+
+def test_weather_lookup_and_weather_scoring_with_wear_history(isolated_store, monkeypatch):
+    monkeypatch.setenv("WEATHER_PROVIDER", "open-meteo")
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, body): self.body = json.dumps(body).encode()
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self): return self.body
+
+    def fake_urlopen(request, timeout=8):
+        calls.append(request.full_url)
+        if "geocoding-api" in request.full_url:
+            return FakeResponse({"results": [{"name": "Pune", "country": "India", "latitude": 18.5, "longitude": 73.8}]})
+        return FakeResponse({"current": {"temperature_2m": 7, "apparent_temperature": 4, "precipitation": 2, "weather_code": 61, "time": "2026-10-11T12:00"}})
+
+    monkeypatch.setattr(main.urllib.request, "urlopen", fake_urlopen)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            token = await register(client)
+            headers = {"Authorization": f"Bearer {token}"}
+            cities = await client.get("/weather/locations", params={"query": "Pune"}, headers=headers)
+            assert cities.status_code == 200 and cities.json()[0]["name"] == "Pune"
+            current = await client.get("/weather/current", params={"latitude": 18.5, "longitude": 73.8, "location": "Pune, India"}, headers=headers)
+            assert current.status_code == 200
+            assert current.json()["source"] == "open-meteo" and current.json()["temperature_c"] == 7
+            jacket = await upload(client, "Winter jacket", "Jacket", "Olive")
+            shirt = await upload(client, "Linen shirt", "Shirt", "Cream")
+            pants = await upload(client, "Dark jeans", "Jeans", "Navy")
+            await client.put("/preferences", json={"styles": [], "colors": [], "occasions": [], "cold_layering": True, "layering": True})
+            plain = (await client.get("/recommendations")).json()
+            weathered = await client.get("/recommendations", params={"occasion": "Work", "temperature_c": 7, "precipitation_mm": 2, "weather_code": 61, "weather_source": "open-meteo", "weather_location": "Pune, India"})
+            assert weathered.status_code == 200
+            result = weathered.json()
+            assert result["weather_context"]["source"] == "open-meteo"
+            jacket_combo = next(combo for combo in result["recommendations"] if jacket["id"] in {x["id"] for x in combo["items"]})
+            assert any("cold conditions" in reason.lower() and "insulation is unknown" in reason.lower() for reason in jacket_combo["reasons"])
+            assert any("rainy conditions" in reason.lower() for reason in jacket_combo["reasons"])
+            assert plain["recommendations"]
+            snowy = (await client.get("/recommendations", params={"temperature_c": 0, "precipitation_mm": 2, "weather_code": 71})).json()
+            snowy_jacket = next(combo for combo in snowy["recommendations"] if jacket["id"] in {x["id"] for x in combo["items"]})
+            assert any("snow protection is unknown" in reason.lower() for reason in snowy_jacket["reasons"])
+            assert not any("rain" in reason.lower() for reason in snowy_jacket["reasons"])
+            outfit = await client.post("/outfits", json={"name": "Warm layers", "item_ids": [jacket["id"], pants["id"]]})
+            worn = await client.post("/wear-events", json={"worn_on": main.date.today().isoformat(), "outfit_id": outfit.json()["id"], "request_id": "weather-history"})
+            assert worn.status_code == 201
+            updated = (await client.get("/recommendations", params={"temperature_c": 7, "precipitation_mm": 2})).json()["recommendations"]
+            recent_combo = next(combo for combo in updated if {x["id"] for x in combo["items"]} == {jacket["id"], pants["id"]})
+            assert any("worn" in reason.lower() or "combination was worn" in reason.lower() for reason in recent_combo["reasons"])
+    run(scenario())
+
+
+def test_weather_provider_network_failure_keeps_manual_recommendations(isolated_store, monkeypatch):
+    monkeypatch.setenv("WEATHER_PROVIDER", "open-meteo")
+    def unavailable(*_args, **_kwargs):
+        raise main.urllib.error.URLError("network details should not reach the user")
+    monkeypatch.setattr(main.urllib.request, "urlopen", unavailable)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            token = await register(client)
+            headers = {"Authorization": f"Bearer {token}"}
+            response = await client.get("/weather/locations", params={"query": "Pune"}, headers=headers)
+            assert response.status_code == 503
+            assert "network details" not in response.json()["detail"]
+            await upload(client, "Shirt", "Shirt", "Blue")
+            await upload(client, "Trousers", "Trousers", "Black")
+            manual = await client.get("/recommendations", params={"temperature_c": 29, "precipitation_mm": 0, "weather_source": "manual"}, headers=headers)
+            assert manual.status_code == 200 and manual.json()["recommendations"]
+            assert manual.json()["weather_context"]["source"] == "manual"
     run(scenario())
 
 

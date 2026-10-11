@@ -8,9 +8,10 @@ A local-first personal wardrobe app. Add clothing photos, organize pieces, save 
 - SQLite persistence, user-scoped clothing CRUD, image replacement, search and category/color/season/favorite filters, favorites, and data export.
 - Safe JPG, PNG, and WebP uploads with content-signature validation and an 8 MB limit. Images are only served to their owner.
 - Optional real image analysis through a locally running Ollama vision model; manual entry works without AI.
-- Saved outfits, occasion-aware outfit suggestions, explainable compatibility scores, style preferences, feedback, and wear counts.
+- Saved outfits, occasion-aware suggestions, explainable compatibility scores, style preferences, feedback, and event-level wear history with insights and recommendation variety scoring.
+- Optional weather-aware outfit ranking. Users can enter conditions manually without any provider, or request current conditions from the configurable Open-Meteo adapter.
 - Private image delivery through authenticated API fetches, loading/error placeholders, and URL resolution based on `VITE_API_BASE_URL` (`VITE_API_URL` remains a compatibility alias).
-- Interactive Style Profile for style identity, favorite/avoided/neutral/accent colors, occasions, seasons, fit, comfort/formality, variety, layering, and recent/disliked controls. Relevant available item metadata affects deterministic recommendation ranking.
+- Interactive Style Profile for style identity, favorite/avoided/neutral/accent colors, occasions, seasons, fit, comfort/formality, variety, layering, and recent/disliked controls. Available clothing attributes, weather context, and event history affect deterministic recommendation ranking.
 - Manual Outfit Builder using the signed-in user's real wardrobe items; one-piece outfits are valid. Saved outfits can be viewed, edited, duplicated, favorited, and deleted.
 - Responsive React/Vite interface with account setup, wardrobe, outfit ideas, saved looks, and style profile.
 
@@ -55,10 +56,10 @@ To use a different API address, create `frontend/.env.local` with `VITE_API_BASE
 
 ## Optional local AI
 
-Install and start Ollama separately, then pull a vision model supported by Ollama. For example:
+Install Ollama separately and pull a vision model supported by Ollama. For example, Qwen2.5-VL 3B is a vision model whose published quantized download is about 3.2 GB; allow additional disk space for the Ollama runtime and model storage. Memory and inference speed depend on your hardware and quantization. Check available disk and memory before pulling it.
 
 ```powershell
-ollama pull llava
+ollama pull qwen2.5vl:3b
 ollama serve
 ```
 
@@ -66,10 +67,25 @@ In the backend terminal, set:
 
 ```powershell
 $env:OLLAMA_URL = "http://localhost:11434"
-$env:OLLAMA_MODEL = "llava"
+$env:OLLAMA_MODEL = "qwen2.5vl:3b"
+$env:OLLAMA_TIMEOUT_SECONDS = "90"
 ```
 
-Restart the API. When the add form's AI option is enabled, the image is sent to the configured local Ollama service and its JSON response is constrained to clothing attributes. The app does not send wardrobe images to a hosted provider. If Ollama is stopped or the model is unavailable, the item is still saved with your manual fields and the interface tells you analysis could not run. A failed validation or database write remains an error and does not appear successful. Model accuracy and hardware speed vary. No Ollama model is installed or bundled by this repository.
+Restart the API. The add form can check `/ai/status` and, when its AI option is enabled, sends the selected image as base64 in Ollama's local `/api/generate` request. JSON is parsed and allowlisted; the user's name/category/color take precedence over generated values. Ollama errors and malformed responses fall back to manual entry with a visible notice; upload validation and database failures remain failures. Images are not sent to a hosted AI provider. No Ollama model is bundled, and real inference has not been verified in this environment. See the [Ollama vision API guide](https://github.com/ollama/ollama/blob/main/docs/capabilities/vision.mdx) and [Qwen2.5-VL 3B model page](https://ollama.com/library/qwen2.5vl%3A3b).
+
+## Optional weather context
+
+The Outfit Ideas page always works without a weather provider. Enter temperature and dry/rain/snow conditions manually, or enable current weather lookup. Lookup uses Open-Meteo geocoding and current forecast endpoints only after the user searches for a city and selects a result; it does not request precise browser location permission.
+
+For personal, noncommercial use, set this in the backend terminal before starting the API:
+
+```powershell
+$env:WEATHER_PROVIDER = "open-meteo"
+```
+
+The public Open-Meteo endpoints are the defaults and do not require a key for noncommercial use. For paid/commercial use, configure the customer endpoint and key through `OPEN_METEO_FORECAST_URL`, `OPEN_METEO_GEOCODING_URL`, and `OPEN_METEO_API_KEY` as specified by your Open-Meteo plan. Never commit a key. If weather is unconfigured or unavailable, the interface reports that and manual conditions remain available. The app sends conditions to recommendation requests only when the user applies them. Weather scores use recorded temperature, precipitation, and condition codes; the app does not infer waterproofing or breathability from unknown garment attributes.
+
+The Open-Meteo free API is limited to noncommercial use and currently documents request limits of 10,000/day, 5,000/hour, and 600/minute; the provider requires attribution under CC BY 4.0. Review the current [usage terms](https://open-meteo.com/en/terms), [pricing](https://open-meteo.com/en/pricing), [forecast API](https://open-meteo.com/en/docs), and [geocoding API](https://open-meteo.com/en/docs/geocoding-api) before enabling it. The Outfit Ideas page links to Open-Meteo and CC BY 4.0 when weather context is available.
 
 ## Data and privacy
 
@@ -84,7 +100,7 @@ Restart the API. When the add form's AI option is enabled, the image is sent to 
 
 ## Style profile and outfit workflow
 
-Use **Style profile** to choose style tags, colors, occasions, seasons, fit/comfort and recommendation controls, then save. Colors to avoid lower matching outfit scores; preferred styles/colors/occasions/seasons and available formality metadata can improve scores. If relevant clothing metadata is missing, scoring falls back to category and palette rules. Layering, rain, warm/cold weather and fit preferences are stored, but are not enforced until clothing or weather data supports them.
+Use **Style profile** to choose style tags, colors, occasions, seasons, fit/comfort and recommendation controls, then save. Colors to avoid lower matching outfit scores; preferred styles/colors/occasions/seasons and available formality metadata can improve scores. If relevant clothing metadata is missing, scoring falls back to category and palette rules. Weather-aware ranking uses selected current/manual conditions plus known category or season tags; it does not infer waterproofing, breathability, or garment warmth. Fit preference is stored but is not scored until clothing fit metadata exists.
 
 Open **Outfit builder** to select actual wardrobe pieces using search, category, or favorites. Save one or more pieces, including a single dress. From **Saved outfits**, edit details and pieces, favorite, duplicate into a new draft, or delete. Recommendation cards open in the builder as recommendation-sourced drafts, and the saved outfit retains that provenance. The API validates clothing ownership on create and update.
 
@@ -104,7 +120,7 @@ npm run build
 
 Backend tests use a temporary SQLite database and temporary upload folder. Frontend dependencies are pinned by the committed `frontend/package-lock.json`.
 
-The browser verification on 2026-10-11 used an isolated temporary database and upload directory. It covered signup, image upload/rendering, profile save and refresh, outfit build/edit/duplicate/delete, recommendation-to-builder, logout/login, and a real API process restart. No existing database or uploads were used. Ollama inference was not configured or tested.
+Backend integration tests use an isolated temporary database and upload directory. The earlier browser verification on 2026-10-11 covered signup, image upload/rendering, profile save and refresh, outfit build/edit/duplicate/delete, recommendation-to-builder, logout/login, and a real API process restart. The current weather/AI UI changes have not been manually browser-verified. Ollama inference is not configured or tested.
 
 ## Deployment notes
 

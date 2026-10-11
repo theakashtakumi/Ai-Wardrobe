@@ -10,16 +10,18 @@ import os
 import secrets
 import sqlite3
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
+from typing import Literal
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.getenv("WARDROBE_DATA_DIR", BASE_DIR / "data"))
@@ -264,6 +266,15 @@ class WearEventInput(BaseModel):
         return value
 
 
+class WeatherInput(BaseModel):
+    temperature_c: float | None = Field(default=None, ge=-80, le=65)
+    precipitation_mm: float | None = Field(default=None, ge=0, le=1000)
+    weather_code: int | None = Field(default=None, ge=0, le=99)
+    source: Literal["manual", "open-meteo"] = "manual"
+    location: str | None = Field(default=None, max_length=120)
+    retrieved_at: str | None = None
+
+
 class PreferencesInput(BaseModel):
     styles: list[str] = []
     colors: list[str] = []
@@ -436,14 +447,110 @@ def analyze_image(data: bytes, content_type: str):
     prompt = "Analyze this single clothing product photo. Reply only as JSON with keys name, category, color, pattern, material, season, occasion, style, formality. Use concise values; use Unknown where not visually inferable. Do not infer brand or personal traits."
     payload = json.dumps({"model": model, "prompt": prompt, "images": [base64.b64encode(data).decode()], "stream": False, "format": "json"}).encode()
     try:
+        timeout = max(1.0, min(180.0, float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "90"))))
+    except ValueError:
+        timeout = 90.0
+    try:
         request = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             result = json.loads(response.read())
-        attrs = json.loads(result.get("response", "{}"))
-        allowed = {"name", "category", "color", "pattern", "material", "season", "occasion", "style", "formality"}
-        return {k: str(v)[:100] for k, v in attrs.items() if k in allowed and isinstance(v, (str, int, float))}, model
-    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(503, f"AI analysis unavailable ({type(exc).__name__}). You can retry without AI by setting OLLAMA_MODEL empty.")
+        if not isinstance(result, dict) or result.get("error"):
+            raise ValueError("invalid provider response")
+        encoded = result.get("response")
+        attrs = json.loads(encoded) if isinstance(encoded, str) else encoded
+        return normalize_ai_attributes(attrs), model
+    except (urllib.error.URLError, TimeoutError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning("Optional clothing analysis unavailable (type=%s)", type(exc).__name__)
+        raise HTTPException(503, "AI analysis is unavailable or returned an unreadable result. You can retry with AI turned off.") from None
+
+
+def normalize_ai_attributes(attrs):
+    allowed = {"name", "category", "color", "pattern", "material", "season", "occasion", "style", "formality"}
+    if not isinstance(attrs, dict):
+        raise ValueError("Vision model response must be a JSON object")
+    normalized = {}
+    for key, value in attrs.items():
+        if key not in allowed or not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            continue
+        clean = " ".join(str(value).split()).strip()[:100]
+        if clean:
+            normalized[key] = clean
+    return normalized
+
+
+@app.get("/ai/status")
+def ai_status(user=Depends(current_user)):
+    model = os.getenv("OLLAMA_MODEL", "").strip()
+    if not model:
+        return {"configured": False, "available": False, "model": None, "message": "Optional clothing analysis is not configured. Manual entry is available."}
+    endpoint = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/") + "/api/tags"
+    try:
+        request = urllib.request.Request(endpoint, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=3) as response:
+            tags = json.loads(response.read())
+        installed = {str(row.get("name", "")) for row in tags.get("models", []) if isinstance(row, dict)}
+        available = model in installed or f"{model}:latest" in installed
+        return {"configured": True, "available": available, "model": model,
+                "message": "Vision model is ready." if available else "Ollama is reachable, but the configured model is not installed."}
+    except Exception as exc:
+        logger.info("Ollama status check unavailable (type=%s)", type(exc).__name__)
+        return {"configured": True, "available": False, "model": model, "message": "Ollama could not be reached. Manual entry remains available."}
+
+
+def weather_provider_settings():
+    provider = os.getenv("WEATHER_PROVIDER", "").strip().lower()
+    if provider != "open-meteo":
+        raise HTTPException(503, "Automatic weather is not configured. Enter weather conditions manually.")
+    forecast_url = os.getenv("OPEN_METEO_FORECAST_URL", "https://api.open-meteo.com/v1/forecast").strip()
+    geocoding_url = os.getenv("OPEN_METEO_GEOCODING_URL", "https://geocoding-api.open-meteo.com/v1/search").strip()
+    api_key = os.getenv("OPEN_METEO_API_KEY", "").strip()
+    if api_key and urllib.parse.urlparse(forecast_url).hostname != "customer-api.open-meteo.com":
+        raise HTTPException(503, "A paid Open-Meteo key requires the customer API endpoint. Use manual weather or check server configuration.")
+    return provider, forecast_url, geocoding_url, api_key
+
+
+def request_weather_json(url, timeout=8):
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Ai-Wardrobe/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read())
+        if not isinstance(data, dict) or data.get("error"):
+            raise ValueError("invalid weather response")
+        return data
+    except (urllib.error.URLError, TimeoutError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning("Weather provider request failed (type=%s)", type(exc).__name__)
+        raise HTTPException(503, "Weather data is unavailable right now. You can enter conditions manually.") from None
+
+
+@app.get("/weather/locations")
+def weather_locations(query: str = Query(min_length=2, max_length=100), user=Depends(current_user)):
+    provider, _, geocoding_url, api_key = weather_provider_settings()
+    params = {"name": query.strip(), "count": 5, "language": "en", "format": "json"}
+    if api_key:
+        params["apikey"] = api_key
+        geocoding_url = geocoding_url.replace("geocoding-api.open-meteo.com", "customer-geocoding-api.open-meteo.com")
+    payload = request_weather_json(f"{geocoding_url}?{urllib.parse.urlencode(params)}")
+    return [{"name": result.get("name", ""), "admin1": result.get("admin1"), "country": result.get("country"),
+             "latitude": result.get("latitude"), "longitude": result.get("longitude"), "timezone": result.get("timezone")}
+            for result in payload.get("results", []) if isinstance(result, dict)]
+
+
+@app.get("/weather/current")
+def current_weather(latitude: float = Query(ge=-90, le=90), longitude: float = Query(ge=-180, le=180),
+                    location: str | None = Query(default=None, max_length=120), user=Depends(current_user)):
+    _, forecast_url, _, api_key = weather_provider_settings()
+    params = {"latitude": latitude, "longitude": longitude,
+              "current": "temperature_2m,apparent_temperature,precipitation,weather_code",
+              "timezone": "auto", "forecast_days": 1}
+    if api_key:
+        params["apikey"] = api_key
+    payload = request_weather_json(f"{forecast_url}?{urllib.parse.urlencode(params)}")
+    current = payload.get("current")
+    if not isinstance(current, dict) or not isinstance(current.get("temperature_2m"), (float, int)):
+        raise HTTPException(503, "Weather provider did not return current conditions. Enter weather manually.")
+    return {"temperature_c": current["temperature_2m"], "apparent_temperature_c": current.get("apparent_temperature"),
+            "precipitation_mm": current.get("precipitation", 0), "weather_code": current.get("weather_code"),
+            "location": location, "source": "open-meteo", "provider_time": current.get("time"), "retrieved_at": now()}
 
 
 @app.post("/wardrobe", status_code=201)
@@ -558,7 +665,7 @@ def update_preferences(body: PreferencesInput, user=Depends(current_user)):
     return body.model_dump()
 
 
-def score_outfit(items, occasion, prefs, feedback, disliked=False, wear_context=None):
+def score_outfit(items, occasion, prefs, feedback, disliked=False, wear_context=None, weather_context=None):
     score, reasons = 55, []
     cats = {x["category"].lower() for x in items}
     if len(items) >= 2 and len(cats) > 1:
@@ -591,6 +698,41 @@ def score_outfit(items, occasion, prefs, feedback, disliked=False, wear_context=
     known_formality = [value for value in known_formality if value is not None]
     if known_formality and abs(sum(known_formality) / len(known_formality) - prefs.get("comfort_formality", 50)) <= 25:
         score += 5; reasons.append("Fits your comfort and formality balance")
+    formal_occasion = bool(occasion and any(term in occasion.lower() for term in ("formal", "gala", "ceremony", "black tie")))
+    if formal_occasion and known_formality:
+        average_formality = sum(known_formality) / len(known_formality)
+        if average_formality >= 70:
+            score += 8; reasons.append("Fits the formality of this occasion")
+        elif average_formality < 40:
+            score -= 10; reasons.append("Ranks lower because known formality is casual for this occasion")
+    if weather_context:
+        temperature = weather_context.temperature_c
+        code = weather_context.weather_code
+        precipitation = weather_context.precipitation_mm or 0
+        categories = [(item.get("category") or "").lower() for item in items]
+        layers = [any(term in category for term in ("jacket", "coat", "outerwear", "cardigan")) for category in categories]
+        seasons = {(item.get("season") or "").strip().lower() for item in items}
+        if temperature is not None and temperature <= 10:
+            if any(layers):
+                score += 8; reasons.append("Includes a catalogued outer layer for cold conditions; insulation is unknown")
+            elif prefs.get("cold_layering") or prefs.get("layering"):
+                score -= 3; reasons.append("No outer layer is catalogued for this cold-weather outfit")
+            if seasons.intersection({"winter", "autumn", "fall"}):
+                score += 4; reasons.append("Matches a recorded cold-season clothing tag")
+        elif temperature is not None and temperature >= 25:
+            if seasons.intersection({"summer", "spring"}):
+                score += 5; reasons.append("Matches a recorded warm-season clothing tag")
+            if any("coat" in category for category in categories):
+                score -= 3; reasons.append("A coat may be less suitable in warm conditions")
+        snowy = code is not None and (71 <= code <= 77 or code in (85, 86))
+        rainy = (code is not None and (51 <= code <= 67 or 80 <= code <= 82 or 95 <= code <= 99)) or (precipitation >= 0.5 and not snowy)
+        if rainy:
+            if any(layers):
+                score += 3; reasons.append("Includes an outer layer for rainy conditions; water resistance is unknown")
+            else:
+                reasons.append("Rain is in the weather context, but rain protection is not recorded for these items")
+        if snowy and any(layers):
+            score += 3; reasons.append("Includes a catalogued outer layer; snow protection is unknown")
     if prefs.get("avoid_recent"):
         recently_worn = 0
         for item in items:
@@ -628,7 +770,16 @@ def score_outfit(items, occasion, prefs, feedback, disliked=False, wear_context=
 
 
 @app.get("/recommendations")
-def recommendations(occasion: str = "", user=Depends(current_user)):
+def recommendations(occasion: str = "", temperature_c: float | None = Query(default=None, ge=-80, le=65),
+                    precipitation_mm: float | None = Query(default=None, ge=0, le=1000),
+                    weather_code: int | None = Query(default=None, ge=0, le=99),
+                    weather_source: Literal["manual", "open-meteo"] = "manual",
+                    weather_location: str | None = Query(default=None, max_length=120),
+                    weather_retrieved_at: str | None = Query(default=None, max_length=80),
+                    user=Depends(current_user)):
+    weather_values = {"temperature_c": temperature_c, "precipitation_mm": precipitation_mm, "weather_code": weather_code}
+    weather_context = WeatherInput(temperature_c=temperature_c, precipitation_mm=precipitation_mm, weather_code=weather_code,
+                                   source=weather_source, location=weather_location, retrieved_at=weather_retrieved_at) if any(value is not None for value in weather_values.values()) else None
     with db() as c:
         items = [item_dict(r) for r in c.execute("SELECT * FROM clothing WHERE user_id=? ORDER BY favorite DESC,wear_count ASC", (user["id"],)).fetchall()]
         pref_row = c.execute("SELECT * FROM preferences WHERE user_id=?", (user["id"],)).fetchone()
@@ -639,7 +790,7 @@ def recommendations(occasion: str = "", user=Depends(current_user)):
           JOIN wear_event_items wi ON wi.event_id=we.id WHERE we.user_id=? AND wi.clothing_id IS NOT NULL
           ORDER BY we.worn_on DESC""", (user["id"],)).fetchall()
     if len(items) < 2:
-        return {"recommendations": [], "message": "Add at least two pieces to get outfit ideas."}
+        return {"recommendations": [], "message": "Add at least two pieces to get outfit ideas.", "weather_context": weather_context.model_dump() if weather_context else None}
     prefs = {k: (json.loads(pref_row[k]) if k in ("styles", "colors", "occasions", "avoid_colors", "neutral_colors", "accent_colors", "seasons") else pref_row[k]) for k in pref_row.keys() if k != "user_id"}
     disliked = {frozenset(row["clothing_id"] for row in disliked_rows if row["outfit_id"] == outfit_id) for outfit_id in {row["outfit_id"] for row in disliked_rows}}
     disliked.update(frozenset(json.loads(row["item_signature"])) for row in disliked_signatures)
@@ -672,10 +823,11 @@ def recommendations(occasion: str = "", user=Depends(current_user)):
             if a["category"] == b["category"] and a["category"].lower() not in ("unknown", "other"): continue
             pair = frozenset((a["id"], b["id"]))
             if prefs.get("exclude_disliked") and pair in disliked: continue
-            score, why = score_outfit([a,b], occasion, prefs, avg, pair in disliked, wear_context)
+            score, why = score_outfit([a,b], occasion, prefs, avg, pair in disliked, wear_context, weather_context)
             combos.append({"items": [a,b], "score": score, "reasons": why, "occasion": occasion or None})
     combos.sort(key=lambda x: (-x["score"], sum(i["wear_count"] for i in x["items"]) * (0.5 + prefs.get("variety", 50) / 50)))
-    return {"recommendations": combos[:6], "message": None}
+    weather_response = weather_context.model_dump() if weather_context else None
+    return {"recommendations": combos[:6], "message": None, "weather_context": weather_response}
 
 
 @app.post("/outfits", status_code=201)
